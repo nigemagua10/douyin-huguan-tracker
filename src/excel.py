@@ -92,12 +92,15 @@ def write_sheet(
     links: Optional[Sequence[Optional[str]]] = None,
     link_col: Optional[int] = None,
     wrap_cols: Sequence[int] = (),
+    left_cols: Sequence[int] = (),
 ) -> None:
     """写一个表：表头着色、冻结首行、加筛选、按内容自适应列宽。
 
-    ``wrap_cols`` 里的列（1 起）开启自动折行并保留原文的分行，行高按内容估算。
+    ``wrap_cols`` 里的列（1 起）开启自动折行并保留原文的分行，行高按内容估算；
+    ``left_cols`` 里的列靠左显示，其余一律居中。
     """
     wrap_cols = tuple(wrap_cols)
+    left_cols = tuple(left_cols)
     ws.append(list(headers))
 
     for idx in range(1, len(headers) + 1):
@@ -114,14 +117,13 @@ def write_sheet(
             cell = ws.cell(row=r_idx, column=c_idx)
             cell.font = BODY_FONT
             cell.border = BORDER
-            if c_idx in wrap_cols:
-                # 自动折行：原文里的 \n 会渲染成真正的换行。
-                # 多行文本用顶部对齐，免得行高略有富余时上下都空一截。
-                cell.alignment = Alignment(horizontal="center", vertical="top",
-                                           wrap_text=True)
-            else:
-                cell.alignment = Alignment(horizontal="center", vertical="center",
-                                           wrap_text=False)
+            wrapped = c_idx in wrap_cols
+            # 折行的列用顶部对齐，免得行高略有富余时上下都空一截
+            cell.alignment = Alignment(
+                horizontal="left" if c_idx in left_cols else "center",
+                vertical="top" if wrapped else "center",
+                wrap_text=wrapped,
+            )
         if links and link_col:
             url = links[r_idx - 2] if r_idx - 2 < len(links) else None
             if url:
@@ -182,10 +184,13 @@ def _user_rows(users: Sequence[Dict[str, Any]]):
 def _write_user_sheet(wb, name: str, color: str, users: Sequence[Dict[str, Any]]) -> None:
     """互关/粉丝/关注三张表结构一样，统一在这里写（简介列开启折行）。"""
     headers, rows, links = _user_rows(users)
+    signature = _col(headers, "简介")
     write_sheet(
         wb.create_sheet(name), headers, rows, color,
         links, link_col=_col(headers, "抖音号"),
-        wrap_cols=(_col(headers, "简介"),),
+        wrap_cols=(signature,),
+        # 简介整段靠左读起来才顺，其余列居中
+        left_cols=(signature,),
     )
 
 
@@ -266,7 +271,46 @@ def build_workbook(
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out)
+    suppress_text_number_warnings(out)
     return out
+
+
+def suppress_text_number_warnings(path) -> None:
+    """让 Excel 不再给「数字以文本形式存储」的格子画绿色小三角。
+
+    抖音号有不少是纯数字（如 ``1564072609``），但它本质是 ID 不是数值，
+    必须按文本存 —— 于是 Excel 会在每个这种格子上报「数字存储为文本」。
+    这里往工作表 XML 里写 ``<ignoredErrors>``，等价于右键「忽略错误」。
+
+    为什么动 XML：openpyxl 定义了 ``IgnoredErrors`` 类，却没挂到 Worksheet 上，
+    没有 API 可用。按 schema，``ignoredErrors`` 必须排在 ``pageMargins`` 之后、
+    ``drawing`` 之前，而 openpyxl 的输出里 ``pageMargins`` 正是最后一个元素，
+    所以直接插在 ``</worksheet>`` 前面就是合法位置。
+    """
+    import re
+    import zipfile
+
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with zipfile.ZipFile(path) as src:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as dst:
+            for name in src.namelist():
+                data = src.read(name)
+                if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name):
+                    xml = data.decode("utf-8")
+                    if "<ignoredErrors" not in xml:
+                        found = re.search(r'<dimension ref="([^"]+)"', xml)
+                        ref = found.group(1) if found else "A1"
+                        if ":" not in ref:
+                            ref = f"A1:{ref}"
+                        xml = xml.replace(
+                            "</worksheet>",
+                            '<ignoredErrors><ignoredError sqref="{}" '
+                            'numberStoredAsText="1"/></ignoredErrors></worksheet>'.format(ref),
+                        )
+                        data = xml.encode("utf-8")
+                dst.writestr(name, data)
+    tmp.replace(path)
 
 
 def harvest_remarks(xlsx_path) -> Dict[str, str]:
