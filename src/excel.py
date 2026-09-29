@@ -52,9 +52,9 @@ USER_COLUMNS = [
     ("简介", lambda u: u.get("signature", "")),
 ]
 
-# 「简介」列的序号（1 起），用来开启折行。从 USER_COLUMNS 推出来，
-# 以后调整列顺序不会失配。
-SIGNATURE_COL = [c[0] for c in USER_COLUMNS].index("简介") + 1
+# 首列是稳定的行号：按粉丝数等排完序后，再按它升序排一次就能回到
+# 原始的时间顺序，不用撤销操作。列里的位置在下面按表头名查，不写死数字。
+SEQ_HEADER = "序号"
 
 WRAP_MAX_WIDTH = 46        # 折行列的列宽上限（再宽就换不了行了）
 ROW_HEIGHT_PER_LINE = 15   # 折行后每行文字占的行高（磅）
@@ -129,7 +129,9 @@ def write_sheet(
     # 否则一段 166 字的简介会把列撑到极限、反而不换行。
     widths: List[float] = [8.0] * (len(headers) + 1)
     for c_idx, header in enumerate(headers, start=1):
-        if c_idx in wrap_cols:
+        if header == SEQ_HEADER:
+            width = 6.0  # 行号列固定窄一点，不占地方
+        elif c_idx in wrap_cols:
             width = _display_width(header) + 4
             for row in rows[:400]:
                 if c_idx - 1 < len(row):
@@ -158,9 +160,17 @@ def write_sheet(
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(rows) + 1}"
 
 
+def _col(headers: Sequence[str], name: str) -> int:
+    """按表头名取列号（1 起）。改列顺序时不用手动改一堆魔法数字。"""
+    return headers.index(name) + 1
+
+
 def _user_rows(users: Sequence[Dict[str, Any]]):
-    headers = [c[0] for c in USER_COLUMNS]
-    rows = [[fn(u) for _, fn in USER_COLUMNS] for u in users]
+    headers = [SEQ_HEADER] + [c[0] for c in USER_COLUMNS]
+    rows = [
+        [i] + [fn(u) for _, fn in USER_COLUMNS]
+        for i, u in enumerate(users, start=1)
+    ]
     links = [u.get("home_url") or None for u in users]
     return headers, rows, links
 
@@ -170,21 +180,23 @@ def _write_user_sheet(wb, name: str, color: str, users: Sequence[Dict[str, Any]]
     headers, rows, links = _user_rows(users)
     write_sheet(
         wb.create_sheet(name), headers, rows, color,
-        links, link_col=3, wrap_cols=(SIGNATURE_COL,),
+        links, link_col=_col(headers, "抖音号"),
+        wrap_cols=(_col(headers, "简介"),),
     )
 
 
 def _event_rows(events: Sequence[Dict[str, Any]], date_label: str):
-    headers = ["备注", "昵称", "抖音号", date_label, "粉丝数"]
+    headers = [SEQ_HEADER, "备注", "昵称", "抖音号", date_label, "粉丝数"]
     rows = [
         [
+            i,
             e.get("remark", ""),
             e.get("nickname", ""),
             e.get("douyin_id", ""),
             e.get("date", ""),
             e.get("follower_count", 0),
         ]
-        for e in events
+        for i, e in enumerate(events, start=1)
     ]
     return headers, rows
 

@@ -56,12 +56,22 @@ jobs:
           assert wb["取关了我"].max_row - 1 == 4, "取关了我数不对"
           assert wb["我取关了"].max_row - 1 == 3, "我取关数不对"
 
-          header = [c.value for c in wb["互关好友"][1]]
-          for col in ("备注", "昵称", "抖音号", "关系", "账号注册时间", "简介"):
+          ws = wb["互关好友"]
+          header = [c.value for c in ws[1]]
+          for col in ("序号", "备注", "昵称", "抖音号", "关系", "账号注册时间", "简介"):
               assert col in header, f"缺少列: {col}"
+          assert header[0] == "序号", "序号必须是第一列"
+
+          # 序号要能用来恢复排序：必须是 1..N 连续
+          for sheet in ("互关好友", "我的粉丝", "我的关注", "取关了我", "新粉丝"):
+              if sheet not in wb.sheetnames:
+                  continue
+              s = wb[sheet]
+              seq = [s.cell(r, 1).value for r in range(2, s.max_row + 1)]
+              assert seq == list(range(1, s.max_row)), \
+                  f"{sheet} 的序号不是 1..N: {seq[:8]}"
 
           # 简介列必须开启自动折行，且原文的换行要原样保留
-          ws = wb["互关好友"]
           si = header.index("简介") + 1
           cells = [ws.cell(r, si) for r in range(2, ws.max_row + 1)]
           assert all(c.alignment.wrap_text for c in cells), "简介列没有开启折行"
