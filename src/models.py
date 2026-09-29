@@ -35,6 +35,17 @@ def _int(v: Any) -> int:
         return 0
 
 
+def _clean_text(v: Any) -> str:
+    """统一换行符、去掉首尾空白，但**保留简介内部的分行**。
+
+    抖音的个性签名里确实带换行（实测 88 条非空简介中 19 条含 ``\\n``），
+    有的还用连续换行做空行。这些是作者排版的一部分，不能压成一行。
+    """
+    if v is None:
+        return ""
+    return str(v).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 @dataclass
 class User:
     uid: str = ""
@@ -133,7 +144,7 @@ def parse_user(item: Dict[str, Any]) -> User:
         sec_uid=str(_pick(u, "sec_uid", "sec_user_id", "secUid") or ""),
         nickname=str(_pick(u, "nickname", "nick_name") or ""),
         douyin_id=str(douyin_id or ""),
-        signature=str(_pick(u, "signature", "desc") or ""),
+        signature=_clean_text(_pick(u, "signature", "desc")),
         remark=str(remark or ""),
         follower_count=_int(_pick(stats, "follower_count") or _pick(u, "follower_count")),
         following_count=_int(_pick(stats, "following_count") or _pick(u, "following_count")),
