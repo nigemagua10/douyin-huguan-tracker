@@ -1,0 +1,33 @@
+# ---- 个人数据：绝对不要提交 ----
+# 采集下来的原始数据、历史快照、生成的报表都包含真实账号信息
+data/raw/*
+!data/raw/.gitkeep
+data/state/*
+!data/state/.gitkeep
+output/*
+!output/.gitkeep
+
+# 备注文件里是真实姓名
+remarks.csv
+
+# --demo 生成的演示数据（随时可重新生成，不必提交）
+demo/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Office 临时/锁文件 ----
+~$*.xlsx
+~$*.docx
+*.tmp
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
