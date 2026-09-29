@@ -1,0 +1,11 @@
+# 统一换行符：源码用 LF，Windows 批处理必须保持 CRLF
+* text=auto eol=lf
+*.bat text eol=crlf
+
+# 二进制/生成物不参与 diff，也不做换行转换
+*.xlsx binary
+*.png binary
+*.jpg binary
+
+# 让 GitHub 正确识别语言统计
+*.js linguist-language=JavaScript
