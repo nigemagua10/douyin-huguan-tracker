@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -51,10 +52,35 @@ USER_COLUMNS = [
     ("简介", lambda u: u.get("signature", "")),
 ]
 
+# 「简介」列的序号（1 起），用来开启折行。从 USER_COLUMNS 推出来，
+# 以后调整列顺序不会失配。
+SIGNATURE_COL = [c[0] for c in USER_COLUMNS].index("简介") + 1
+
+WRAP_MAX_WIDTH = 46        # 折行列的列宽上限（再宽就换不了行了）
+ROW_HEIGHT_PER_LINE = 15   # 折行后每行文字占的行高（磅）
+
 
 def _display_width(value: Any) -> int:
     """中文按 2 个字符宽计算。"""
     return sum(2 if ord(ch) > 127 else 1 for ch in str(value))
+
+
+def _longest_line_width(value: Any) -> int:
+    """多行文本里最长那一行的宽度（折行列按它定列宽，而不是按整段长度）。"""
+    return max((_display_width(line) for line in str(value).split("\n")), default=0)
+
+
+def _estimated_lines(value: Any, width: float) -> int:
+    """估算一个单元格折行后占几行。
+
+    Excel/openpyxl 都不会自己算这个，不显式设行高的话行只会显示一行高，
+    多出来的内容被截断 —— 而 WPS / LibreOffice 也不会自动撑开。
+    """
+    usable = max(width - 1.5, 1)
+    total = 0
+    for line in str(value).split("\n"):
+        total += max(1, math.ceil(_display_width(line) / usable))
+    return max(total, 1)
 
 
 def write_sheet(
@@ -64,8 +90,13 @@ def write_sheet(
     color: str,
     links: Optional[Sequence[Optional[str]]] = None,
     link_col: Optional[int] = None,
+    wrap_cols: Sequence[int] = (),
 ) -> None:
-    """写一个表：表头着色、冻结首行、加筛选、按内容自适应列宽。"""
+    """写一个表：表头着色、冻结首行、加筛选、按内容自适应列宽。
+
+    ``wrap_cols`` 里的列（1 起）开启自动折行并保留原文的分行，行高按内容估算。
+    """
+    wrap_cols = tuple(wrap_cols)
     ws.append(list(headers))
 
     for idx in range(1, len(headers) + 1):
@@ -82,7 +113,11 @@ def write_sheet(
             cell = ws.cell(row=r_idx, column=c_idx)
             cell.font = BODY_FONT
             cell.border = BORDER
-            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            if c_idx in wrap_cols:
+                # 顶部对齐 + 自动折行：原文里的 \n 会渲染成真正的换行
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+            else:
+                cell.alignment = Alignment(vertical="center", wrap_text=False)
         if links and link_col:
             url = links[r_idx - 2] if r_idx - 2 < len(links) else None
             if url:
@@ -90,13 +125,34 @@ def write_sheet(
                 cell.hyperlink = url
                 cell.font = Font(size=10, color="0563C1", underline="single")
 
-    # 列宽：表头与内容取最大值，夹在 8~52 之间
+    # 列宽：表头与内容取最大值。折行列按「最长的一行」算，并收在可读宽度内，
+    # 否则一段 166 字的简介会把列撑到极限、反而不换行。
+    widths: List[float] = [8.0] * (len(headers) + 1)
     for c_idx, header in enumerate(headers, start=1):
-        width = _display_width(header) + 4
-        for row in rows[:400]:
-            if c_idx - 1 < len(row):
-                width = max(width, _display_width(row[c_idx - 1]) + 3)
-        ws.column_dimensions[get_column_letter(c_idx)].width = min(max(width, 8), 52)
+        if c_idx in wrap_cols:
+            width = _display_width(header) + 4
+            for row in rows[:400]:
+                if c_idx - 1 < len(row):
+                    width = max(width, _longest_line_width(row[c_idx - 1]) + 3)
+            width = min(max(width, 20), WRAP_MAX_WIDTH)
+        else:
+            width = _display_width(header) + 4
+            for row in rows[:400]:
+                if c_idx - 1 < len(row):
+                    width = max(width, _display_width(row[c_idx - 1]) + 3)
+            width = min(max(width, 8), 52)
+        widths[c_idx] = width
+        ws.column_dimensions[get_column_letter(c_idx)].width = width
+
+    # 折行列显式设行高 —— 不设的话行只显示一行高，多出来的文字会被截掉
+    if wrap_cols:
+        for r_idx, row in enumerate(rows, start=2):
+            lines = 1
+            for c_idx in wrap_cols:
+                if c_idx - 1 < len(row):
+                    lines = max(lines, _estimated_lines(row[c_idx - 1], widths[c_idx]))
+            if lines > 1:
+                ws.row_dimensions[r_idx].height = min(lines * ROW_HEIGHT_PER_LINE, 409)
 
     if rows:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(rows) + 1}"
@@ -107,6 +163,15 @@ def _user_rows(users: Sequence[Dict[str, Any]]):
     rows = [[fn(u) for _, fn in USER_COLUMNS] for u in users]
     links = [u.get("home_url") or None for u in users]
     return headers, rows, links
+
+
+def _write_user_sheet(wb, name: str, color: str, users: Sequence[Dict[str, Any]]) -> None:
+    """互关/粉丝/关注三张表结构一样，统一在这里写（简介列开启折行）。"""
+    headers, rows, links = _user_rows(users)
+    write_sheet(
+        wb.create_sheet(name), headers, rows, color,
+        links, link_col=3, wrap_cols=(SIGNATURE_COL,),
+    )
 
 
 def _event_rows(events: Sequence[Dict[str, Any]], date_label: str):
@@ -142,16 +207,13 @@ def build_workbook(
     wb = Workbook()
     wb.remove(wb.active)
 
-    headers, rows, links = _user_rows(mutual)
-    write_sheet(wb.create_sheet("互关好友"), headers, rows, COLOR_MUTUAL, links, link_col=3)
+    _write_user_sheet(wb, "互关好友", COLOR_MUTUAL, mutual)
 
     if has_fans:
-        headers, rows, links = _user_rows(fans)
-        write_sheet(wb.create_sheet("我的粉丝"), headers, rows, COLOR_FANS, links, link_col=3)
+        _write_user_sheet(wb, "我的粉丝", COLOR_FANS, fans)
 
     if has_following:
-        headers, rows, links = _user_rows(following)
-        write_sheet(wb.create_sheet("我的关注"), headers, rows, COLOR_FOLLOWING, links, link_col=3)
+        _write_user_sheet(wb, "我的关注", COLOR_FOLLOWING, following)
 
     if lost_fans:
         headers, rows = _event_rows(lost_fans, "取关于")
