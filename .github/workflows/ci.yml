@@ -83,5 +83,15 @@ jobs:
               assert ws.row_dimensions[r].height and ws.row_dimensions[r].height > 15, \
                   f"第 {r} 行是多行简介，行高却没有撑开"
 
+          # 全表统一：所有有内容的格子都要加粗 + 水平居中
+          for sheet in wb.sheetnames:
+              for row in wb[sheet].iter_rows():
+                  for cell in row:
+                      if cell.value is None and not cell.hyperlink:
+                          continue
+                      assert cell.font.bold, f"{sheet}!{cell.coordinate} 未加粗"
+                      assert cell.alignment.horizontal == "center", \
+                          f"{sheet}!{cell.coordinate} 未水平居中"
+
           print(f"报表校验通过: {wb.sheetnames}（多行简介 {len(multiline)} 条）")
           EOF

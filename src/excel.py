@@ -12,7 +12,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
-BODY_FONT = Font(size=10)
+BODY_FONT = Font(size=10, bold=True)
+LINK_FONT = Font(size=10, bold=True, color="0563C1", underline="single")
 _SIDE = Side(style="thin", color="D9D9D9")
 BORDER = Border(left=_SIDE, right=_SIDE, top=_SIDE, bottom=_SIDE)
 
@@ -114,16 +115,19 @@ def write_sheet(
             cell.font = BODY_FONT
             cell.border = BORDER
             if c_idx in wrap_cols:
-                # 顶部对齐 + 自动折行：原文里的 \n 会渲染成真正的换行
-                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                # 自动折行：原文里的 \n 会渲染成真正的换行。
+                # 多行文本用顶部对齐，免得行高略有富余时上下都空一截。
+                cell.alignment = Alignment(horizontal="center", vertical="top",
+                                           wrap_text=True)
             else:
-                cell.alignment = Alignment(vertical="center", wrap_text=False)
+                cell.alignment = Alignment(horizontal="center", vertical="center",
+                                           wrap_text=False)
         if links and link_col:
             url = links[r_idx - 2] if r_idx - 2 < len(links) else None
             if url:
                 cell = ws.cell(row=r_idx, column=link_col)
                 cell.hyperlink = url
-                cell.font = Font(size=10, color="0563C1", underline="single")
+                cell.font = LINK_FONT
 
     # 列宽：表头与内容取最大值。折行列按「最长的一行」算，并收在可读宽度内，
     # 否则一段 166 字的简介会把列撑到极限、反而不换行。
