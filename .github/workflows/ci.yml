@@ -123,3 +123,16 @@ jobs:
           print(f"报表校验通过: {wb.sheetnames}（多行简介 {len(multiline)} 条，"
                 f"{len(sheets)} 个工作表已忽略文本数字警告）")
           EOF
+
+      - name: 同一天重跑不应重复累积事件
+        run: |
+          # 必须显式指定编码：Windows 上默认是 GBK，读 UTF-8 的历史文件会炸
+          count() { python -c "import json;print(len(json.load(open('demo/state/history.json',encoding='utf-8'))['events']))"; }
+          runs()  { python -c "import json;print(len(json.load(open('demo/state/history.json',encoding='utf-8'))['runs']))"; }
+          before_events=$(count); before_runs=$(runs)
+          python src/main.py --raw-dir demo/raw --state demo/state/history.json \
+                             --remarks demo/remarks.csv --output-dir demo/output > /dev/null
+          after_events=$(count); after_runs=$(runs)
+          echo "事件 $before_events -> $after_events，快照 $before_runs -> $after_runs"
+          test "$before_events" = "$after_events" || { echo "事件被重复累积"; exit 1; }
+          test "$before_runs" = "$after_runs" || { echo "快照被重复追加"; exit 1; }

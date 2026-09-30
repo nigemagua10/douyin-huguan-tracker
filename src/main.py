@@ -491,6 +491,15 @@ def run_once(
         "mutual": sum(1 for u in users.values() if u.get("relation") == "互关"),
     }
 
+    # 同一天重复采集：先把这一天的旧记录连同它产生的事件撤掉，
+    # 否则对比基准会变成「它自己」，算出来永远是 0 变化；
+    # 事件流水也会被同一批人重复累积。
+    runs = history.get("runs") or []
+    if runs and runs[-1].get("date") == run_date:
+        runs.pop()
+        history["events"] = [e for e in (history.get("events") or [])
+                             if e.get("date") != run_date]
+
     prev = last_run(history)
     delta, events = compute_delta(run=run, prev=prev, warnings=warnings)
     run["delta"] = delta
