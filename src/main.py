@@ -118,6 +118,63 @@ def _traversal_ascending(raw_meta: Dict[str, Any]) -> bool:
     return len(seq) >= 2 and _num(seq[1]) > _num(seq[0])
 
 
+def _page_start_offsets(raw_meta: Dict[str, Any]) -> Dict[int, int]:
+    """从翻页日志推出每一页的起始 offset。
+
+    抖音自 2026-09 起改用 offset 分页：响应里的 ``offset`` 是「已返回的总条数」，
+    减掉本页条数就是本页的起始位置 —— 也就是这一页在整个列表里的真实位置，
+    比数组下标可靠得多（用户滚两遍会把数组顺序打乱）。
+
+    只统计有数据的页，和采集器里的页号（用户记录上的 ``_p``）对齐。
+    """
+    out: Dict[int, int] = {}
+    page = 0
+    for entry in raw_meta.get("log") or []:
+        n = _num(entry.get("n"))
+        if n <= 0:
+            continue
+        page += 1
+        offset = (entry.get("fields") or {}).get("offset")
+        if offset is None:
+            continue
+        out[page] = _num(offset) - n
+    return out
+
+
+def order_by_api(
+    users: List[User], raw_meta: Dict[str, Any]
+) -> Tuple[List[User], str]:
+    """按接口自己的顺序排好，统一成「最新 → 最早」。返回 ``(列表, 依据)``。
+
+    抖音这个接口前后换过三种分页方式，按可靠性依次尝试：
+
+    1. ``offset``（2026-09 起）—— 响应直接给出已返回条数，最可靠
+    2. ``max_time`` / ``min_time`` 时间游标（更早）—— 后来恒为 0，已废弃
+    3. 数组顺序 —— 兜底；用户中途才滚动、或翻了两遍时这个顺序会乱
+
+    统一成「最新在前」之后，显示方向交给 ``--sort`` 决定。
+    """
+
+    page_starts = _page_start_offsets(raw_meta)
+    if page_starts and any(u.page_no for u in users):
+        def offset_key(u: User):
+            start = page_starts.get(u.page_no)
+            if start is None:
+                return (1, 0, 0)  # 没有页信息的排到最后
+            return (0, start, u.page_index)
+
+        return sorted(users, key=offset_key), "offset"
+
+    if any(u.cursor_max for u in users):
+        ascending = raw_meta.get("ascending")
+        if ascending is None:
+            ascending = _traversal_ascending(raw_meta)
+        # order_by_time 给的是「最早 → 最新」，这里翻成「最新 → 最早」
+        return list(reversed(order_by_time(users, bool(ascending)))), "time_cursor"
+
+    return list(users), "array"
+
+
 def order_by_time(users: List[User], ascending: bool) -> List[User]:
     """按时间升序（最早 -> 最新）重排。
 
@@ -162,16 +219,11 @@ def build_snapshot(
         if isinstance(raw, list) and _collector_reversed(data, raw_meta):
             raw = list(reversed(raw))
 
-        ascending = raw_meta.get("ascending")
-        if ascending is None:
-            ascending = _traversal_ascending(raw_meta)
-        ascending = bool(ascending)
-
-        # 重排成「最早 -> 最新」，之后 follow_order 就是准确的时间升序位次
-        parsed = order_by_time(parse_many(raw), ascending)
+        # 统一按接口自己的顺序排成「最新 -> 最早」，follow_order 即位次
+        parsed, basis = order_by_api(parse_many(raw), raw_meta)
         lists[kind] = parsed
         meta[kind] = {
-            "ascending": ascending,
+            "order_basis": basis,
             "file": path.name,
             "date": run_date,
             "count": len(parsed),
@@ -372,9 +424,13 @@ def run_once(
 
     label_of = {"following": "关注", "fans": "粉丝"}
 
+    basis_name = {"offset": "offset 分页", "time_cursor": "时间游标", "array": "数组顺序"}
+
     for kind, info in meta.items():
         extra = f"（接口报总数 {info['api_total']}）" if info.get("api_total") else ""
-        print(f"[+] {label_of[kind]}：{info['count']} 人{extra}  <- {info['file']}")
+        basis = basis_name.get(info.get("order_basis"), "未知")
+        print(f"[+] {label_of[kind]}：{info['count']} 人{extra}"
+              f"  排序依据：{basis}  <- {info['file']}")
 
     for kind in (k for k in KINDS if k not in meta):
         warnings.append(f"本次没有采集到「{label_of[kind]}」数据，相关对比与分表已跳过。")
@@ -382,6 +438,12 @@ def run_once(
     # 采集完整性：接口自己说的「还有更多」比任何猜测都可靠
     for kind, info in meta.items():
         label = label_of[kind]
+        if info.get("order_basis") == "array":
+            warnings.append(
+                f"「{label}」的接口返回里既没有 offset 也没有时间游标，排序只能退回采集顺序。"
+                f"如果你采集时中途才开始滚动、或者来回翻了两遍，这个顺序会是乱的 —— "
+                f"建议重新采集：打开页面后先滚到最上面，再一路滚到底。"
+            )
         if info.get("has_more") is True:
             warnings.append(
                 f"「{label}」采集时接口仍报告还有下一页（has_more=1），列表很可能没拉完，"
@@ -571,15 +633,12 @@ def make_sort_key(earliest_first: bool):
     """
 
     def key(d: Dict[str, Any]):
-        cursor = d.get("cursor_max") or 0
-        if not cursor:
-            # 没有游标（很早的旧数据）只能排到最后
-            return (1, 0, 0)
-        # follow_order 已在 order_by_time 里归一化成「最早 -> 最新」的位次，
-        # 所以同一页内正序即时间正序，配合 cursor 就能得到完整时间顺序
-        order = d.get("follow_order") or 0
-        return (0, cursor if earliest_first else -cursor,
-                order if earliest_first else -order)
+        # follow_order 已由 order_by_api 归一化成「最新 -> 最早」的位次：
+        # 越小 = 关注得越晚。「最早在前」就是把它倒过来。
+        order = d.get("follow_order")
+        if order is None:
+            return (1, 0, d.get("nickname") or "")
+        return (0, -order if earliest_first else order, "")
 
     return key
 
