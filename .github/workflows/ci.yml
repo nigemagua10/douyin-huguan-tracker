@@ -124,6 +124,31 @@ jobs:
                 f"{len(sheets)} 个工作表已忽略文本数字警告）")
           EOF
 
+      - name: 首次采集（零历史）的排序也必须正确
+        run: |
+          rm -rf .ci-tmp/firstrun
+          python src/main.py --raw-dir demo/raw --state .ci-tmp/firstrun/history.json \
+                             --remarks .ci-tmp/firstrun/remarks.csv --output-dir .ci-tmp/firstrun/out
+          python - <<'EOF'
+          import glob, json
+          from openpyxl import load_workbook
+
+          # 全新用户：状态目录是空的，等价于刚 clone 下来第一次跑
+          h = json.load(open(".ci-tmp/firstrun/history.json", encoding="utf-8"))
+          assert len(h["runs"]) == 1, f"首次运行应当只有一条快照，实际 {len(h['runs'])}"
+          assert not h["events"], "首次运行不该产生变化事件"
+
+          src = sorted(glob.glob("demo/raw/*.json"))[-1]   # 文件名即日期，取最新那份
+          api_order = [u["nickname"] for u in json.load(open(src, encoding="utf-8"))["following"]]
+
+          wb = load_workbook(sorted(glob.glob(".ci-tmp/firstrun/out/*.xlsx"))[-1])
+          ws = wb["互关好友"]
+          got = [ws.cell(r, 3).value for r in range(2, ws.max_row + 1)]
+          assert got == api_order[::-1], \
+              "首次采集的排序就不对 —— 排序不该依赖任何前置数据"
+          print(f"首次采集排序正确：{len(got)} 人，零历史下即为接口顺序的倒序")
+          EOF
+
       - name: 同一天重跑不应重复累积事件
         run: |
           # 必须显式指定编码：Windows 上默认是 GBK，读 UTF-8 的历史文件会炸

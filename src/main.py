@@ -305,7 +305,12 @@ def compute_delta(
     events: List[Dict[str, Any]] = []
 
     if prev is None:
-        warnings.append("这是首次采集，本次仅建立基线，不产生「取关/新增」记录。下次运行即可看到变化。")
+        warnings.append(
+            # 注意：这里写进的是 Excel 单元格，不支持 markdown，别用 ** 加粗
+            "这是首次采集，所以「取关了我 / 新粉丝」这类变化表还没有内容——"
+            "它们需要两次采集对比才有。但表格的排序是准确的："
+            "首次采集就已经按关注时间排好，不依赖任何前置数据。"
+        )
         return delta, events
 
     def mk_events(keys, info_from, etype, date):
@@ -431,6 +436,11 @@ def run_once(
         basis = basis_name.get(info.get("order_basis"), "未知")
         print(f"[+] {label_of[kind]}：{info['count']} 人{extra}"
               f"  排序依据：{basis}  <- {info['file']}")
+        # 把排序依据写进报表的「提示」页 —— 第一次用的人也能看到顺序是可依据的
+        warnings.append(
+            f"「{label_of[kind]}」的排序依据：{basis}。顺序由接口返回的分页位置还原，"
+            f"与你采集时怎么滚动、翻了几遍无关，首次采集就是准的。"
+        )
 
     for kind in (k for k in KINDS if k not in meta):
         warnings.append(f"本次没有采集到「{label_of[kind]}」数据，相关对比与分表已跳过。")

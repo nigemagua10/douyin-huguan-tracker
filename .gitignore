@@ -13,6 +13,9 @@ remarks.csv
 # --demo 生成的演示数据（随时可重新生成，不必提交）
 demo/
 
+# CI 用的临时目录
+.ci-tmp/
+
 # ---- Python ----
 __pycache__/
 *.py[cod]
