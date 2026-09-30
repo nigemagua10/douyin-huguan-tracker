@@ -83,23 +83,33 @@ jobs:
               assert ws.row_dimensions[r].height and ws.row_dimensions[r].height > 15, \
                   f"第 {r} 行是多行简介，行高却没有撑开"
 
-          # 全表统一：所有有内容的格子加粗；除「简介」靠左外一律水平居中
+          # 全表统一：所有有内容的格子加粗；长文本列（简介、提示说明）靠左，
+          # 其余一律水平居中
+          LEFT_ALIGNED = {"简介", "说明"}
           for sheet in wb.sheetnames:
               sh = wb[sheet]
               head = [c.value for c in sh[1]]
-              left_idx = head.index("简介") + 1 if "简介" in head else None
+              left_cols = {i + 1 for i, h in enumerate(head) if h in LEFT_ALIGNED}
               # 表头行始终居中，规则从第 2 行开始套
               for row in sh.iter_rows(min_row=2):
                   for cell in row:
                       if cell.value is None and not cell.hyperlink:
                           continue
                       assert cell.font.bold, f"{sheet}!{cell.coordinate} 未加粗"
-                      want = "left" if cell.column == left_idx else "center"
+                      want = "left" if cell.column in left_cols else "center"
                       assert cell.alignment.horizontal == want, \
                           f"{sheet}!{cell.coordinate} 水平对齐应为 {want}"
               for cell in sh[1]:
                   assert cell.font.bold and cell.alignment.horizontal == "center", \
                       f"{sheet}!{cell.coordinate} 表头未加粗居中"
+
+          # 「提示」页的说明是整句中文，必须折行并撑开行高，不能一行走到底
+          if "提示" in wb.sheetnames:
+              tip = wb["提示"]
+              for r in range(2, tip.max_row + 1):
+                  assert tip.cell(r, 1).alignment.wrap_text, f"提示页第 {r} 行没折行"
+                  assert (tip.row_dimensions[r].height or 0) > 15, \
+                      f"提示页第 {r} 行行高没撑开"
 
           # 排序：默认 --sort earliest，互关表应当正好是「接口顺序」的倒序。
           # 接口按「最近关注 -> 最早关注」返回，所以倒过来就是最早在前。

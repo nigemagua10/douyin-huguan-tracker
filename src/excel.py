@@ -265,8 +265,10 @@ def build_workbook(
     write_sheet(wb.create_sheet("历史概览"), overview_headers, overview_rows, COLOR_HISTORY)
 
     if warnings:
+        # 说明都是整句中文，和「简介」列一样折行 + 靠左，不要一行走到底
         ws = wb.create_sheet("提示")
-        write_sheet(ws, ["说明"], [[w] for w in warnings], COLOR_HISTORY)
+        write_sheet(ws, ["说明"], [[w] for w in warnings], COLOR_HISTORY,
+                    wrap_cols=(1,), left_cols=(1,))
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
