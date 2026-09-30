@@ -30,7 +30,7 @@
   const STORE_KEY = '__dy_collector_data';
   // 改动去重逻辑等会影响存量数据正确性的地方时，把这个版本号 +1。
   // 旧版本存下来的数据会在加载时被自动丢弃，用户不需要手动清理。
-  const STORE_VERSION = 7;
+  const STORE_VERSION = 8;
 
   const state = {
     following: new Map(), // sec_uid -> user
@@ -166,10 +166,22 @@
       if (m.pageSeq.length === 2) m.ascending = m.pageSeq[1] > m.pageSeq[0];
     }
 
+    // 这一页是第几页（只数有数据的页）。**要在写日志之前递增**，
+    // 否则日志里的 page 会跟用户记录上的 _p 差一位。
+    if (list.length) m.pageNo = (m.pageNo || 0) + 1;
+
     // 逐页留痕。下载的 JSON 里带着这份轨迹，卡住时能直接看出到底是
     // 「页数没拉完」还是「同一个游标被反复返回同一页」。
     m.log = m.log || [];
     if (m.log.length < 400) {
+      // 记下接口返回的**全部顶层标量字段**。抖音会改字段名 —— 曾经
+      // max_time/min_time 有真实时间戳，后来变成恒为 0，翻页游标换了地方。
+      // 全量记下来，才不用靠猜。
+      const fields = {};
+      for (const [k, v] of Object.entries(json)) {
+        if (v === null || typeof v === 'object') continue;
+        fields[k] = v;
+      }
       m.log.push({
         n: list.length,
         key: arrKey || null,
@@ -177,6 +189,8 @@
         total: json.total,
         max_time: json.max_time,
         min_time: json.min_time,
+        page: list.length ? m.pageNo : null,
+        fields,
       });
     }
     if (!arrKey) m.unknownShape = (m.unknownShape || 0) + 1;
@@ -188,20 +202,27 @@
 
     const bucket = state[type];
     let added = 0;
-    for (const item of list) {
+    const pageKeys = [];   // 这一页的用户，保持接口返回的先后
+    for (let idx = 0; idx < list.length; idx++) {
+      const item = list[idx];
       const u = normalize(item);
       if (!u) continue;
 
-      // 翻页游标就是「关注时间」的时间戳。接口不返回每个人的关注时间，
-      // 但每页的 max_time/min_time 给出了这一页所有人的时间区间。
-      // 只在首次见到时记录，避免同一页被重复拉取时覆盖。
+      // 记录这条是在「第几页、页内第几个」首次出现的。只在首次见到时写，
+      // 避免同一页被重复拉取时覆盖。这是游标失效后唯一可靠的顺序线索。
       const old = bucket.get(u._key);
-      if (old && old.cursor_max) {
+      if (old) {
+        u._p = old._p;
+        u._pi = old._pi;
         u.cursor_max = old.cursor_max;
         u.cursor_min = old.cursor_min;
-      } else if (json.max_time) {
-        u.cursor_max = json.max_time;
-        u.cursor_min = json.min_time;
+      } else {
+        u._p = m.pageNo;
+        u._pi = idx;
+        if (json.max_time) {
+          u.cursor_max = json.max_time;
+          u.cursor_min = json.min_time;
+        }
       }
 
       if (!old) added++;
@@ -211,8 +232,14 @@
           if (!u[k] && old[k]) u[k] = old[k];
         }
       }
+      pageKeys.push(u._key);
       bucket.set(u._key, u);
     }
+
+    // 记下每一页的成员和页内先后。接口不给游标时，只要其中有一遍是
+    // 「从列表一头翻到另一头」的完整翻页，就能按它把全局顺序拼回来。
+    m.pageKeys = m.pageKeys || [];
+    if (m.pageKeys.length < 400) m.pageKeys.push(pageKeys);
 
     if (added > 0) state.idleRounds = 0;
     scheduleSave();

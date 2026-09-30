@@ -61,6 +61,8 @@ class User:
     follow_status: int = 0
     cursor_max: int = 0          # 所在页的翻页游标上界（= 关注时间上界）
     cursor_min: int = 0          # 所在页的翻页游标下界（= 关注时间下界）
+    page_no: int = 0             # 采集时属于第几页（只数有数据的页）
+    page_index: int = 0          # 在这一页里排第几个
     extra: Dict[str, Any] = field(default_factory=dict, repr=False)  # 接口返回的其余标量字段
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -153,6 +155,8 @@ def parse_user(item: Dict[str, Any]) -> User:
         follow_status=_int(_pick(item, "follow_status") or _pick(u, "follow_status")),
         cursor_max=_int(_pick(item, "cursor_max")),
         cursor_min=_int(_pick(item, "cursor_min")),
+        page_no=_int(_pick(item, "_p")),
+        page_index=_int(_pick(item, "_pi")),
         extra=item.get("extra") if isinstance(item.get("extra"), dict) else {},
         raw=item if isinstance(item, dict) else {},
     )

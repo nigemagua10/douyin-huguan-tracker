@@ -79,29 +79,64 @@ def _fake_user(uid: int, rng: random.Random, follow_status: int, cursor: int) ->
     }
 
 
-def _snapshot(day: str, following: List[Dict], fans: List[Dict]) -> Dict[str, Any]:
+PAGE_SIZE = 20
+
+
+def _meta_for(items: List[Dict], key: str) -> Dict[str, Any]:
+    """照着**现在的**接口形态造翻页元数据：offset 分页 + 每页成员。
+
+    抖音自 2026-09 起把 ``max_time`` 改成恒为 0、换用 ``offset`` 当游标，
+    所以示例数据也按 offset 来，保证 --demo 走的是和线上同一条代码路径。
+    """
+    pages = [items[i:i + PAGE_SIZE] for i in range(0, len(items), PAGE_SIZE)]
+    log = []
+    for no, page in enumerate(pages, start=1):
+        returned = min(no * PAGE_SIZE, len(items))
+        log.append({
+            "n": len(page),
+            "key": key,
+            "more": no < len(pages),
+            "total": len(items),
+            "max_time": 0,
+            "min_time": 0,
+            "page": no,
+            "fields": {
+                "offset": returned,      # 已返回的总条数
+                "max_time": 0,           # 已废弃，恒为 0
+                "min_time": 0,
+                "total": len(items),
+                "has_more": no < len(pages),
+                "status_code": 0,
+            },
+        })
     return {
-        "v": 7,
+        "hasMore": False,
+        "total": len(items),
+        "pages": len(pages),
+        "rawCount": len(items),
+        "pageNo": len(pages),
+        "log": log,
+        "pageKeys": [[u["sec_uid"] for u in page] for page in pages],
+    }
+
+
+def _snapshot(day: str, following: List[Dict], fans: List[Dict]) -> Dict[str, Any]:
+    # 补上「第几页 / 页内第几个」，这是 offset 排序的依据
+    for items in (following, fans):
+        for i, u in enumerate(items):
+            u["_p"] = i // PAGE_SIZE + 1
+            u["_pi"] = i % PAGE_SIZE
+            u["cursor_max"] = 0      # 时间游标已废弃
+            u["cursor_min"] = 0
+
+    return {
+        "v": 8,
         "collected_at": f"{day}T10:00:00.000Z",
         "date": day,
         "source": "demo（全部为虚构数据）",
         "meta": {
-            kind: {
-                "hasMore": False,
-                "total": len(items),
-                "pages": len({u["cursor_max"] for u in items}),
-                "rawCount": len(items),
-                "ascending": True,
-                "log": [
-                    {"n": 20, "key": key, "more": True, "total": len(items),
-                     "max_time": c, "min_time": c - 86_400 * 90}
-                    for c in sorted({u["cursor_max"] for u in items})
-                ],
-            }
-            for kind, key, items in (
-                ("following", "followings", following),
-                ("fans", "followers", fans),
-            )
+            "following": _meta_for(following, "followings"),
+            "fans": _meta_for(fans, "followers"),
         },
         "following_count": len(following),
         "fans_count": len(fans),

@@ -101,6 +101,15 @@ jobs:
                   assert cell.font.bold and cell.alignment.horizontal == "center", \
                       f"{sheet}!{cell.coordinate} 表头未加粗居中"
 
+          # 排序：默认 --sort earliest，互关表应当正好是「接口顺序」的倒序。
+          # 接口按「最近关注 -> 最早关注」返回，所以倒过来就是最早在前。
+          import json as _json
+          raw = _json.load(open(glob.glob("demo/raw/demo_2026-08-20.json")[0], encoding="utf-8"))
+          api_order = [u["nickname"] for u in raw["following"]]
+          sheet_order = [ws.cell(r, 3).value for r in range(2, ws.max_row + 1)]
+          assert sheet_order == api_order[::-1], \
+              "互关好友的排序不是接口顺序的倒序（offset 排序或方向判断出错了）"
+
           # 纯数字的抖音号会触发 Excel「数字以文本形式存储」警告，必须已忽略
           import re, zipfile
           with zipfile.ZipFile(sorted(files)[-1]) as z:
