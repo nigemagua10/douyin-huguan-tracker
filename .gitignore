@@ -4,6 +4,9 @@ data/raw/*
 !data/raw/.gitkeep
 data/state/*
 !data/state/.gitkeep
+# 手机 ADB 采集的中间结果（含真实昵称）
+data/phone/*
+!data/phone/.gitkeep
 output/*
 !output/.gitkeep
 

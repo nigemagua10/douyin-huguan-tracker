@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime
@@ -118,12 +119,49 @@ def _traversal_ascending(raw_meta: Dict[str, Any]) -> bool:
     return len(seq) >= 2 and _num(seq[1]) > _num(seq[0])
 
 
-def _page_start_offsets(raw_meta: Dict[str, Any]) -> Dict[int, int]:
-    """从翻页日志推出每一页的起始 offset。
+def _sink_risk_uids(raw_meta: Dict[str, Any]) -> List[str]:
+    """接口明确标记为「风险 / 隐藏」的账号 UID。
 
-    抖音自 2026-09 起改用 offset 分页：响应里的 ``offset`` 是「已返回的总条数」，
-    减掉本页条数就是本页的起始位置 —— 也就是这一页在整个列表里的真实位置，
-    比数组下标可靠得多（用户滚两遍会把数组顺序打乱）。
+    抖音的粉丝列表响应会在顶层 ``store_page`` 里塞一个 ``sink_risk_uids``：
+    这些账号**计入 total，但接口不返回昵称、抖音号、粉丝数、简介**，列表里
+    也看不到。它们不是客户端漏抓 —— 手机 App 拿到的也是同一份数据。
+
+    新采集器会直接汇总到 ``meta.sinkRiskUids``；旧数据没有这个字段，就退回
+    解析采集器原样记下的 ``log[].fields.store_page``。
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def add(v) -> None:
+        s = str(v)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    for v in raw_meta.get("sinkRiskUids") or []:
+        add(v)
+
+    for entry in raw_meta.get("log") or []:
+        store = (entry.get("fields") or {}).get("store_page")
+        if not store:
+            continue
+        try:
+            obj = json.loads(store) if isinstance(store, str) else store
+        except (TypeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            for v in obj.get("sink_risk_uids") or []:
+                add(v)
+
+    return out
+
+
+def _page_start_offsets(raw_meta: Dict[str, Any]) -> Dict[int, int]:
+    """从翻页日志推出每一页的起始位置（0 表示列表最前面）。
+
+    采集器优先记录**请求 URL / 请求体里的 offset**（``fields.req_offset``），
+    那才是这一页在列表里的真实起点；旧采集器只记响应里的 ``offset``，它是
+    「已返回的总条数」，减掉本页条数就是起点。
 
     只统计有数据的页，和采集器里的页号（用户记录上的 ``_p``）对齐。
     """
@@ -134,11 +172,100 @@ def _page_start_offsets(raw_meta: Dict[str, Any]) -> Dict[int, int]:
         if n <= 0:
             continue
         page += 1
-        offset = (entry.get("fields") or {}).get("offset")
+        fields = entry.get("fields") or {}
+        req_offset = fields.get("req_offset")
+        if req_offset is not None:
+            out[page] = _num(req_offset)
+            continue
+        offset = fields.get("offset")
         if offset is None:
             continue
         out[page] = _num(offset) - n
     return out
+
+
+def _complete_page_offsets(raw_meta: Dict[str, Any]) -> Optional[Dict[int, int]]:
+    """返回可信的「页 -> 起始位置」；不可信时返回 ``None``。
+
+    抖音的响应会把 ``offset`` 时有时无地置 0（近期实测整次采集全是 0），
+    这时 ``offset - n`` 是负数。只有当每一页都带位置、起点从 0 开始、且
+    随页号不递减时，才用 offset 排序；否则交给时间游标兜底。
+    """
+    starts = _page_start_offsets(raw_meta)
+    if len(starts) < 2:
+        return None
+    pages = sorted(starts)
+    vals = [starts[p] for p in pages]
+    if vals[0] != 0:
+        return None
+    if any(v < 0 for v in vals):
+        return None
+    if not any(v > 0 for v in vals):
+        return None
+    if any(b < a for a, b in zip(vals, vals[1:])):
+        return None
+    return starts
+
+
+def _effective_ascending(raw_meta: Dict[str, Any]) -> bool:
+    """列表的原生方向是不是「最早 → 最新」。
+
+    采集器会记 ``ascending``；旧数据没有这个字段时，从翻页日志的
+    ``max_time`` 前两个不同值推断。
+    """
+    asc = raw_meta.get("ascending")
+    if asc is None:
+        asc = _traversal_ascending(raw_meta)
+    return bool(asc)
+
+
+def _hybrid_order(
+    users: List[User], raw_meta: Dict[str, Any]
+) -> Optional[List[User]]:
+    """混合分页的还原顺序（最早 → 最新）。
+
+    近期实测抖音的「关注」列表会同时出现两种页：
+    - 前几页：只有 offset（列表顶部，最近关注在前）；
+    - 其余页：只有时间游标（从列表底部往上加载，时间递增）。
+
+    直接把两段按数组拼会乱。这里分别处理：
+    - 时间游标页：按游标升序，页内按接口顺序（最早 → 最新）；
+    - offset 页：按 offset 倒序（offset 20 比 offset 0 早），页内倒序。
+
+    拼出来正好是「最早 → 最新」。返回 ``None`` 表示不是这种混合形态。
+    """
+    cursor_pages: Dict[int, int] = {}
+    offset_pages: Dict[int, int] = {}
+    page = 0
+    for entry in raw_meta.get("log") or []:
+        n = _num(entry.get("n"))
+        if n <= 0:
+            continue
+        page += 1
+        fields = entry.get("fields") or {}
+        mt = _num(entry.get("max_time"))
+        off = fields.get("offset")
+        if mt:
+            cursor_pages[page] = mt
+        elif off is not None and _num(off) > 0:
+            offset_pages[page] = _num(off) - n
+
+    if not cursor_pages or not offset_pages:
+        return None
+
+    by_page: Dict[int, List[User]] = {}
+    for u in users:
+        by_page.setdefault(u.page_no, []).append(u)
+
+    ordered: List[User] = []
+    for p in sorted(cursor_pages, key=lambda p: cursor_pages[p]):
+        ordered += sorted(by_page.get(p, []), key=lambda u: u.page_index)
+    for p in sorted(offset_pages, key=lambda p: offset_pages[p], reverse=True):
+        ordered += sorted(by_page.get(p, []), key=lambda u: u.page_index, reverse=True)
+
+    seen = {id(u) for u in ordered}
+    ordered += [u for u in users if id(u) not in seen]
+    return ordered
 
 
 def order_by_api(
@@ -148,14 +275,22 @@ def order_by_api(
 
     抖音这个接口前后换过三种分页方式，按可靠性依次尝试：
 
-    1. ``offset``（2026-09 起）—— 响应直接给出已返回条数，最可靠
-    2. ``max_time`` / ``min_time`` 时间游标（更早）—— 后来恒为 0，已废弃
-    3. 数组顺序 —— 兜底；用户中途才滚动、或翻了两遍时这个顺序会乱
+    1. 完整的 ``offset`` 分页 —— 每页都有真实起点且从 0 开始，最可靠
+    2. ``max_time`` / ``min_time`` 时间游标 —— 只有在**每一批**都带游标时
+       才用；混着 0 的页没法定位，硬排只会更乱
+    3. offset + 时间游标的混合分页 —— 按页类型分别排序后拼接
+    4. 数组顺序 —— 兜底；用户中途才滚动、或来回翻了两遍时这个顺序会乱，
+       报表的「提示」页会明确警告
 
     统一成「最新在前」之后，显示方向交给 ``--sort`` 决定。
-    """
 
-    page_starts = _page_start_offsets(raw_meta)
+    ⚠️ ``ascending`` 只用于时间游标分支判断页内方向。offset/数组分支
+    保持「列表顶部在前」：抖音的关注列表顶部通常是最近关注，但采集时
+    如果中途跳到过底部再往上滚，数组顺序本身就会是跳的，不能靠它还原。
+    """
+    ascending = _effective_ascending(raw_meta)
+
+    page_starts = _complete_page_offsets(raw_meta)
     if page_starts and any(u.page_no for u in users):
         def offset_key(u: User):
             start = page_starts.get(u.page_no)
@@ -163,15 +298,20 @@ def order_by_api(
                 return (1, 0, 0)  # 没有页信息的排到最后
             return (0, start, u.page_index)
 
-        return sorted(users, key=offset_key), "offset"
+        ordered = sorted(users, key=offset_key)
+        return ordered, "offset"
 
-    if any(u.cursor_max for u in users):
-        ascending = raw_meta.get("ascending")
-        if ascending is None:
-            ascending = _traversal_ascending(raw_meta)
+    if users and all(u.cursor_max for u in users):
         # order_by_time 给的是「最早 → 最新」，这里翻成「最新 → 最早」
-        return list(reversed(order_by_time(users, bool(ascending)))), "time_cursor"
+        return list(reversed(order_by_time(users, ascending))), "time_cursor"
 
+    hybrid = _hybrid_order(users, raw_meta)
+    if hybrid is not None:
+        # _hybrid_order 给的是「最早 → 最新」，这里翻成「最新 → 最早」
+        return list(reversed(hybrid)), "mixed"
+
+    # 数组顺序 = 采集顺序。数组开头就是列表顶部（通常是最近关注），
+    # 保持原样，让 --sort earliest 反向、--sort recent 保持。
     return list(users), "array"
 
 
@@ -200,6 +340,8 @@ def build_snapshot(
     users: Dict[str, Dict[str, Any]] = {}
     lists: Dict[str, Optional[List[User]]] = {k: None for k in KINDS}
     meta: Dict[str, Any] = {}
+    diag_unknown: List[Dict[str, Any]] = []
+    diag_seen: set = set()
 
     for kind in KINDS:
         src = sources.get(kind)
@@ -210,6 +352,12 @@ def build_snapshot(
             continue
 
         data = load_json(path, {})
+        # 采集器没认出来的接口（路径改版时用来提示漏采）
+        for item in (data.get("diag") or {}).get("unknown") or []:
+            p = item.get("path")
+            if p and p not in diag_seen:
+                diag_seen.add(p)
+                diag_unknown.append(item)
         raw = data.get("following") if kind == "following" else (
             data.get("fans") if data.get("fans") is not None else data.get("followers")
         )
@@ -222,13 +370,30 @@ def build_snapshot(
         # 统一按接口自己的顺序排成「最新 -> 最早」，follow_order 即位次
         parsed, basis = order_by_api(parse_many(raw), raw_meta)
         lists[kind] = parsed
+        sink_risk = _sink_risk_uids(raw_meta)
+        # 只统计“确实没采到”的风险账号：采集器汇总和翻页日志可能各漏/多几个，
+        # 用已采到的 uid 做一次差集，再把上限压到「总数 - 已采到」，
+        # 保证报表里的数字和 api_total 对得上。
+        collected_uids = {u.uid for u in parsed if u.uid}
+        sink_missing = [x for x in sink_risk if x not in collected_uids]
+        api_total = raw_meta.get("total")
+        if api_total:
+            gap = max(_num(api_total) - len(parsed), 0)
+            sink_count = min(len(sink_missing), gap) if gap else 0
+        else:
+            sink_count = len(sink_missing)
         meta[kind] = {
             "order_basis": basis,
+            # 列表原生方向：True = 最早在前，False = 最近在前
+            "ascending": _effective_ascending(raw_meta),
             "file": path.name,
             "date": run_date,
             "count": len(parsed),
-            "api_total": raw_meta.get("total"),
+            "api_total": api_total,
             "has_more": raw_meta.get("hasMore"),
+            # 接口明确标了“风险/隐藏”的账号：计入总数，但不给资料
+            "sink_risk_uids": sink_risk,
+            "sink_risk_count": sink_count,
         }
 
         for idx, user in enumerate(parsed):
@@ -253,7 +418,7 @@ def build_snapshot(
                 if not old.get(f) and entry.get(f):
                     old[f] = entry[f]
 
-    return users, {"lists": lists, "meta": meta}
+    return users, {"lists": lists, "meta": meta, "diag": diag_unknown}
 
 
 # ------------------------------------------------------------ 差异对比
@@ -308,8 +473,8 @@ def compute_delta(
         warnings.append(
             # 注意：这里写进的是 Excel 单元格，不支持 markdown，别用 ** 加粗
             "这是首次采集，所以「取关了我 / 新粉丝」这类变化表还没有内容——"
-            "它们需要两次采集对比才有。但表格的排序是准确的："
-            "首次采集就已经按关注时间排好，不依赖任何前置数据。"
+            "它们需要两次采集对比才有。表格的排序依据见上方说明："
+            "写的是 offset 分页、时间游标或混合分页才代表顺序可考证。"
         )
         return delta, events
 
@@ -424,48 +589,140 @@ def run_once(
     lists = bundle["lists"]
     meta = bundle["meta"]
 
+    following_users = lists["following"] or []
+    fans_users = lists["fans"] or []
+
+    # 粉丝补全：粉丝接口会漏掉一部分互关。用关注列表里 follow_status=2
+    # 的人补回来 —— 这批人在关注列表里有完整资料，而且确定关注了你。
+    fan_keys = {u.key for u in fans_users}
+    supplemented = [
+        u for u in following_users
+        if u.follow_status == 2 and u.key not in fan_keys
+    ]
+
     run_date = date_override or max(m["date"] for m in meta.values())
     warnings: List[str] = []
 
     label_of = {"following": "关注", "fans": "粉丝"}
 
-    basis_name = {"offset": "offset 分页", "time_cursor": "时间游标", "array": "数组顺序"}
+    basis_name = {
+        "offset": "offset 分页",
+        "time_cursor": "时间游标",
+        "mixed": "offset + 时间游标（混合）",
+        "array": "数组顺序",
+    }
+
+    for item in bundle.get("diag") or []:
+        warnings.append(
+            f"采集器遇到未识别接口：{item.get('path')}（{item.get('n', 0)} 条）。"
+            f"可能是抖音改版，导致部分列表没记录；建议把这条反馈到 issue。"
+        )
 
     for kind, info in meta.items():
         extra = f"（接口报总数 {info['api_total']}）" if info.get("api_total") else ""
         basis = basis_name.get(info.get("order_basis"), "未知")
         print(f"[+] {label_of[kind]}：{info['count']} 人{extra}"
               f"  排序依据：{basis}  <- {info['file']}")
-        # 把排序依据写进报表的「提示」页 —— 第一次用的人也能看到顺序是可依据的
-        warnings.append(
-            f"「{label_of[kind]}」的排序依据：{basis}。顺序由接口返回的分页位置还原，"
-            f"与你采集时怎么滚动、翻了几遍无关，首次采集就是准的。"
-        )
+        # 把排序依据写进报表的「提示」页 —— 第一次用的人也能看到顺序的可信度
+        if info.get("order_basis") == "array":
+            warnings.append(
+                f"「{label_of[kind]}」的排序依据：采集顺序（列表顶部在前）。"
+            )
+        else:
+            warnings.append(
+                f"「{label_of[kind]}」的排序依据：{basis}。顺序由接口返回的翻页位置还原，"
+                f"不依赖你采集时滚动了几遍。"
+            )
 
     for kind in (k for k in KINDS if k not in meta):
         warnings.append(f"本次没有采集到「{label_of[kind]}」数据，相关对比与分表已跳过。")
 
-    # 采集完整性：接口自己说的「还有更多」比任何猜测都可靠
+    # 采集完整性：先看接口报的总数，再看 has_more；两者矛盾时以总数为准
     for kind, info in meta.items():
         label = label_of[kind]
+        count = info["count"]
+        total = info.get("api_total")
+        hidden = info.get("sink_risk_count") or 0
+
         if info.get("order_basis") == "array":
             warnings.append(
-                f"「{label}」的接口返回里既没有 offset 也没有时间游标，排序只能退回采集顺序。"
-                f"如果你采集时中途才开始滚动、或者来回翻了两遍，这个顺序会是乱的 —— "
-                f"建议重新采集：打开页面后先滚到最上面，再一路滚到底。"
+                f"「{label}」的接口返回里没有完整、可用的分页位置（offset 或时间游标），"
+                f"排序退回采集顺序（列表顶部在前）。如果你中途跳到过底部、或者来回"
+                f"翻了两遍，这个顺序会和你在页面上看到的不一致 —— 建议重新采集："
+                f"先滚到最上面，再一路滚到底。"
             )
-        if info.get("has_more") is True:
+
+        if total and count >= total:
+            # 人数已经和接口总数对上，即使某页还带着 has_more=1 也算采全了
+            continue
+
+        if total and count < total:
+            gap = total - count
+            explained = bool(hidden and hidden == gap)
+            if explained:
+                recovered = len(supplemented) if kind == "fans" else 0
+                rest = max(gap - recovered, 0)
+                msg = (
+                    f"「{label}」采集到 {count} 人，接口报总数 {total}，差 {gap} 人。"
+                    f"这 {gap} 人正好是接口在 store_page.sink_risk_uids 里标记的"
+                    f"风险/隐藏账号（接口只返回 UID，不返回昵称、抖音号、粉丝数和简介）。"
+                )
+                if recovered:
+                    msg += (
+                        f"其中 {recovered} 个是互关好友，已用关注列表的 "
+                        f"follow_status=2 补入「我的粉丝」表末尾"
+                        f"（顺序按关注列表），现在显示 {count + recovered} 人；"
+                    )
+                if rest:
+                    msg += f"其余 {rest} 个是单向粉丝，接口没有资料。"
+                else:
+                    msg += "互关部分已经补齐。"
+                warnings.append(msg)
+            else:
+                recovered = len(supplemented) if kind == "fans" else 0
+                rest = max(gap - recovered, 0)
+                msg = (
+                    f"「{label}」采集到 {count} 人，接口报总数 {total}，差 {gap} 人。"
+                )
+                if hidden:
+                    msg += (
+                        f"接口标记的风险/隐藏账号有 {hidden} 个"
+                        f"（只有 UID、没有资料）。"
+                    )
+                else:
+                    msg += (
+                        "这部分通常是已注销/被封禁或设为私密的账号，"
+                        "抖音的列表本身就不会列出它们。"
+                    )
+                if recovered:
+                    msg += (
+                        f"已用关注列表补入 {recovered} 个互关"
+                        f"（排在粉丝表末尾，顺序按关注列表），粉丝表显示 "
+                        f"{count + recovered} 人；"
+                    )
+                if rest:
+                    msg += f"仍差 {rest} 个单向粉丝，接口没有资料。"
+                else:
+                    msg += "差额已全部解释。"
+                warnings.append(msg)
+            if info.get("has_more") is True and not explained:
+                warnings.append(
+                    f"「{label}」采集时接口仍报告还有下一页（has_more=1），"
+                    f"但已采到的人数少于接口总数，建议重新采集并滚到最底部。"
+                )
+        elif info.get("has_more") is True:
             warnings.append(
-                f"「{label}」采集时接口仍报告还有下一页（has_more=1），列表很可能没拉完，"
-                f"建议重新采集并滚到最底部。"
+                f"「{label}」采集时接口仍报告还有下一页（has_more=1），"
+                f"列表可能没拉完，建议重新采集并滚到最底部。"
             )
-        elif info.get("api_total") and info["count"] < info["api_total"]:
-            gap = info["api_total"] - info["count"]
-            warnings.append(
-                f"「{label}」采集到 {info['count']} 人，接口报总数 {info['api_total']}，差 {gap} 人。"
-                f"这部分通常是已注销/被封禁或设为私密的账号，抖音的列表本身就不会列出它们，"
-                f"所以总数看着虚高，属正常现象。"
-            )
+
+    # 互关是全的：直接用关注列表的 follow_status=2，不依赖粉丝列表
+    mutual_count = sum(1 for u in following_users if u.follow_status == 2)
+    if mutual_count:
+        warnings.append(
+            f"「互关好友」共 {mutual_count} 人，全部来自关注列表的 follow_status=2，"
+            f"不依赖粉丝列表，已经是完整的。"
+        )
 
     # 3) 备注
     harvested = excel.harvest_remarks(_newest_xlsx(out_dir))
@@ -479,9 +736,6 @@ def run_once(
     if reset:
         print("[*] 已按 --reset 清空历史。")
 
-    following_users = lists["following"] or []
-    fans_users = lists["fans"] or []
-
     # 关系以抖音自己标的 follow_status 为准，不靠两个列表求交集
     annotate_relations(users, following_users, fans_users)
 
@@ -491,13 +745,16 @@ def run_once(
         "has_following": lists["following"] is not None,
         "has_fans": lists["fans"] is not None,
         "following": [u.key for u in following_users],
+        # 差异对比仍用粉丝接口的原始集合：补进来的互关上次也没有，
+        # 如果混进 run["fans"]，会在下一次运行凭空多出新粉丝。
         "fans": [u.key for u in fans_users],
         "users": users,
         "sources": {k: v["file"] for k, v in meta.items()},
     }
     run["counts"] = {
         "following": len(following_users),
-        "fans": len(fans_users),
+        # 展示口径：粉丝接口 + 从关注列表补入的互关
+        "fans": len(fans_users) + len(supplemented),
         "mutual": sum(1 for u in users.values() if u.get("relation") == "互关"),
     }
 
@@ -533,9 +790,16 @@ def run_once(
     sort_key = make_sort_key(earliest_first=(sort == "earliest"))
 
     def rows_for(user_list: List[User]) -> List[Dict[str, Any]]:
-        """把 User 换成带 home_url 的 dict，并按关注时间排序。"""
+        """把 User 换成带 home_url 的 dict。
+
+        ``user_list`` 已经由 ``order_by_api`` 排成「最新 -> 最早」，这里只按
+        ``--sort`` 决定正反。**不能再用合并后的 ``follow_order``**：同一个人
+        同时在两个列表里时，它会沿用先处理的「关注」列表位次，
+        导致「我的粉丝」表按关注顺序排，而不是按粉丝自己的顺序。
+        """
         out = [by_key[u.key] for u in user_list if u.key in by_key]
-        out.sort(key=sort_key)
+        if sort == "earliest":
+            out.reverse()
         return out
 
     out_path = out_dir / f"抖音好友关注_{run_date}.xlsx"
@@ -544,7 +808,7 @@ def run_once(
             (u for u in users.values() if u.get("relation") == "互关"),
             key=sort_key,
         ),
-        fans=rows_for(fans_users),
+        fans=rows_for(fans_users) + rows_for(supplemented),
         following=rows_for(following_users),
         lost_fans=pick("unfollowed_me"),
         new_fans=pick("new_fan"),

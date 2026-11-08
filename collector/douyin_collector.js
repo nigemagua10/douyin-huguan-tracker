@@ -41,9 +41,11 @@
     saveTimer: null,
     // 记录接口自己报的分页状态，用来判断「到底了没有」
     meta: {
-      following: { hasMore: null, total: null, pages: 0 },
-      fans: { hasMore: null, total: null, pages: 0 },
+      following: { hasMore: null, total: null, pages: 0, sinkRiskUids: new Set() },
+      fans: { hasMore: null, total: null, pages: 0, sinkRiskUids: new Set() },
     },
+    // 未识别的接口（路径改版时用来让用户反馈真实 URL）
+    diag: { unknown: [] },
   };
 
   /* ------------------------------------------------------------------ 工具 */
@@ -119,11 +121,43 @@
     };
   }
 
-  function ingest(url, text) {
+  /** 从 URL 查询串 / 请求体里取 offset（分页起点）。取不到返回 null。 */
+  function pickOffset(text) {
+    if (!text || typeof text !== 'string') return null;
+    const q = /(?:^|[?&])offset=(-?\d+)/.exec(text);
+    if (q) return Number(q[1]);
+    try {
+      const obj = JSON.parse(text);
+      if (obj && obj.offset !== undefined && obj.offset !== null) {
+        return Number(obj.offset);
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  /** 记录一个「看起来像用户列表、但路径没认出来」的接口，供用户反馈。 */
+  function recordUnknown(url, json, arrKey, n) {
+    const path = String(url).split('?')[0];
+    const d = state.diag;
+    if (d.unknown.some((x) => x.path === path)) return;
+    const keys = Object.keys(json)
+      .filter((k) => json[k] === null || typeof json[k] !== 'object')
+      .slice(0, 30);
+    d.unknown.push({ path, arrKey: arrKey || null, n, keys });
+    if (d.unknown.length > 20) d.unknown.shift();
+    log(`未识别接口：${path}（列表字段 ${arrKey || '?'}，${n} 条）`);
+  }
+
+  function ingest(url, text, reqOffset) {
+    // 已知路径先认；路径改版时，只要还带 following/follower + list 也认，
+    // 不再死守 /user/xxx/list/ 这一种拼法。
     let type = null;
-    if (/\/user\/following\/list\//.test(url)) type = 'following';
-    else if (/\/user\/follower\/list\//.test(url)) type = 'fans';
-    if (!type) return;
+    const u = String(url).toLowerCase();
+    if (/following/.test(u) && /list/.test(u)) type = 'following';
+    else if (/(follower|fans)/.test(u) && /list/.test(u)) type = 'fans';
+
+    // 不认识的接口也读一下：如果返回里像用户列表，记下来给用户反馈
+    if (!type && !/list|follow|fans|mutual|relation/.test(u)) return;
 
     let json;
     try {
@@ -138,6 +172,16 @@
     const arrKey = CANDIDATES.find((k) => Array.isArray(json[k]));
     const list = arrKey ? json[arrKey] : [];
 
+    if (!type) {
+      // 从列表字段名再兜底认一次
+      if (arrKey === 'followings') type = 'following';
+      else if (arrKey === 'followers') type = 'fans';
+    }
+    if (!type) {
+      if (list.length) recordUnknown(url, json, arrKey, list.length);
+      return;
+    }
+
     // 先记分页状态 —— 粉丝列表的首页可能是空的但带着 total/max_time
     const m = state.meta[type];
     // 去重前的原始条数：和去重后的差多少，就知道去重吃掉了多少
@@ -149,6 +193,20 @@
       m.total = Number(json.total);
     }
     m.pages += 1;
+
+    // 抖音会把「计入总数但不在列表里显示」的粉丝 UID 放在 store_page 里。
+    // 这些账号没有昵称/抖音号/资料，网页和手机 App 都拿不到，单独记下来，
+    // 报表才能说清楚「差的那 N 人」到底是什么。
+    try {
+      const sp = typeof json.store_page === 'string'
+        ? JSON.parse(json.store_page)
+        : json.store_page;
+      if (sp && Array.isArray(sp.sink_risk_uids)) {
+        for (const v of sp.sink_risk_uids) {
+          if (v !== null && v !== undefined) m.sinkRiskUids.add(String(v));
+        }
+      }
+    } catch (e) {}
 
     // 判断列表是按「最近关注」还是「最早关注」返回的。
     // 依据：翻页游标就是关注时间；如果拿到最后一批数据那页的游标
@@ -178,6 +236,9 @@
       // max_time/min_time 有真实时间戳，后来变成恒为 0，翻页游标换了地方。
       // 全量记下来，才不用靠猜。
       const fields = {};
+      // 记下请求里的分页起点。响应里的 offset 在部分版本里恒为 0，
+      // 只有请求本身带的 offset 才能还原「这一页在列表里的真实位置」。
+      if (reqOffset !== undefined && reqOffset !== null) fields.req_offset = reqOffset;
       for (const [k, v] of Object.entries(json)) {
         if (v === null || typeof v === 'object') continue;
         fields[k] = v;
@@ -252,6 +313,7 @@
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     try {
       this.__dy_url = String(url || '');
+      this.__dy_req_offset = pickOffset(this.__dy_url);
     } catch (e) {}
     return origOpen.call(this, method, url, ...rest);
   };
@@ -259,6 +321,10 @@
   const origSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.send = function (...args) {
     try {
+      // 列表接口有的把 offset 放在 POST body 里，open 阶段还拿不到
+      if (this.__dy_req_offset == null && typeof args[0] === 'string') {
+        this.__dy_req_offset = pickOffset(args[0]);
+      }
       const url = this.__dy_url || '';
       if (url) {
         this.addEventListener('load', () => {
@@ -269,7 +335,7 @@
             if (rt === 'json' && typeof this.response === 'object') {
               text = JSON.stringify(this.response);
             }
-            if (text) ingest(url, text);
+            if (text) ingest(url, text, this.__dy_req_offset);
           } catch (e) {}
         });
       }
@@ -282,9 +348,13 @@
     const p = origFetch.apply(this, args);
     try {
       const url = typeof args[0] === 'string' ? args[0] : args[0] && args[0].url;
-      if (url && /\/(following|follower)\/list\//.test(String(url))) {
+      if (url && /list|follow|fans|mutual|relation/i.test(String(url))) {
+        let reqOffset = pickOffset(String(url));
+        if (reqOffset == null && args[1] && typeof args[1].body === 'string') {
+          reqOffset = pickOffset(args[1].body);
+        }
         p.then((res) => {
-          res.clone().text().then((t) => ingest(String(url), t)).catch(() => {});
+          res.clone().text().then((t) => ingest(String(url), t, reqOffset)).catch(() => {});
         }).catch(() => {});
       }
     } catch (e) {}
@@ -311,20 +381,29 @@
     const before =
       state.following.size + state.fans.size;
 
+    // 小步滚动，不要一下跳到 scrollHeight —— 抖音的列表是虚拟列表，
+    // 直接跳到底会让页面跳过中间页，采到的页顺序就和列表顺序对不上。
+    const SCROLL_STEP = 360;
     for (const el of scrollables()) {
-      el.scrollTop = el.scrollHeight;
+      const max = Math.max(0, el.scrollHeight - el.clientHeight);
+      if (el.scrollTop < max) {
+        el.scrollTop = Math.min(el.scrollTop + SCROLL_STEP, max);
+      }
     }
-    window.scrollTo(0, document.body.scrollHeight);
+    // 页面本身是滚动容器时也小步滚
+    if (window.scrollY + window.innerHeight < document.documentElement.scrollHeight - 2) {
+      window.scrollBy(0, SCROLL_STEP);
+    }
 
     setTimeout(() => {
       const after = state.following.size + state.fans.size;
       state.idleRounds = after > before ? 0 : state.idleRounds + 1;
       render();
 
-      // 接口说还有更多时给更长的耐心，避免在长列表上停早
+      // 小步慢滚时，网络慢一点可能连续几轮都没更新，耐心给足
       const pendingMore =
         state.meta.following.hasMore === true || state.meta.fans.hasMore === true;
-      const limit = pendingMore ? 25 : 6;
+      const limit = pendingMore ? 30 : 10;
 
       if (state.idleRounds >= limit) {
         const why = pendingMore
@@ -346,6 +425,11 @@
 
   /* --------------------------------------------------------------- 持久化 */
 
+  /** 把 meta 里的 Set 转成可 JSON 化的数组。 */
+  function dumpMeta(m) {
+    return { ...m, sinkRiskUids: [...(m.sinkRiskUids || [])] };
+  }
+
   function dump() {
     // 这里**故意不重排数组**：采集顺序 + 每条的页游标 + m.ascending
     // 已经足够让 Python 还原出正确的时间顺序。在采集器里猜方向只会
@@ -357,9 +441,11 @@
       source: 'douyin.com (browser session)',
       // 接口自报的分页状态，用来判断这次采集是否完整
       meta: {
-        following: { ...state.meta.following },
-        fans: { ...state.meta.fans },
+        following: dumpMeta(state.meta.following),
+        fans: dumpMeta(state.meta.fans),
       },
+      // 未识别接口的轨迹：路径改版时，把它反馈回来就能定位
+      diag: { unknown: state.diag.unknown },
       following_count: state.following.size,
       fans_count: state.fans.size,
       following: [...state.following.values()],
@@ -395,6 +481,11 @@
       for (const u of d.fans || []) if (u._key) state.fans.set(u._key, u);
       for (const k of ['following', 'fans']) {
         if (d.meta && d.meta[k]) Object.assign(state.meta[k], d.meta[k]);
+        // 旧缓存里没有这个字段；有也是数组，恢复时转回 Set
+        const s = state.meta[k].sinkRiskUids;
+        state.meta[k].sinkRiskUids = new Set(
+          Array.isArray(s) ? s.map(String) : (s instanceof Set ? [...s] : [])
+        );
       }
       log(`已从 localStorage 恢复：关注 ${state.following.size} / 粉丝 ${state.fans.size}`);
     } catch (e) {}
@@ -485,12 +576,26 @@
       }</div>
       <div style="font-size:11px;margin:0 0 2px 8px">${tag(m)} · 已拉 ${m.pages} 页${
         m.rawCount ? ` · 原始 ${m.rawCount} 条` : ''
-      }</div>`;
+      }</div>
+      ${
+        m.sinkRiskUids && m.sinkRiskUids.size
+          ? `<div style="font-size:11px;margin:0 0 2px 8px;color:#f59e0b">
+               其中 ${m.sinkRiskUids.size} 个被接口标为风险/隐藏（只有 UID，没有资料）
+             </div>`
+          : ''
+      }`;
 
     bodyEl.innerHTML = `
       ${line('关注', state.following.size, state.meta.following, '#60a5fa')}
       ${line('粉丝', state.fans.size, state.meta.fans, '#4ade80')}
       <div>互关：<b style="color:#fbbf24">${mutual}</b> 人</div>
+      ${
+        state.diag.unknown.length
+          ? `<div style="font-size:11px;color:#f59e0b;margin-top:4px">
+               未识别接口 ${state.diag.unknown.length} 个，控制台运行 __dyUnknown() 查看
+             </div>`
+          : ''
+      }
       <div style="color:#9ca3af;font-size:11px;margin-top:4px">
         ${state.autoScroll ? '自动滚动中…' : '已暂停'} · 空转 ${state.idleRounds}
       </div>`;
@@ -506,6 +611,7 @@
 
   window.__dyCollector = true;
   window.__dyStatus = () => dump();
+  window.__dyUnknown = () => state.diag.unknown;
   window.__dyDump = download;
   window.__dyStop = () => {
     state.autoScroll = false;

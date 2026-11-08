@@ -10,6 +10,9 @@
  *   3. 再切到「粉丝」标签，往下滚几次
  *   4. 把控制台里所有 [诊断] 开头的输出截图/复制出来
  *
+ * 如果路径改版了，脚本会把「未识别」的用户列表接口也打出来（带 URL 和
+ * 顶层字段），把那段发到 issue 就能定位。
+ *
  * 提示：如果自动滚动没生效，手动滚动同样会触发请求，效果一样。
  * ========================================================================== */
 (() => {
@@ -20,15 +23,12 @@
     return;
   }
 
-  const hits = { following: 0, fans: 0 };
+  const hits = { following: 0, fans: 0, unknown: 0 };
 
   function report(url, text) {
-    const isFollowing = /\/user\/following\/list\//.test(url);
-    const isFans = /\/user\/follower\/list\//.test(url);
-    if (!isFollowing && !isFans) return;
-
-    const kind = isFollowing ? 'following' : 'fans';
-    hits[kind]++;
+    const u = String(url).toLowerCase();
+    const isFollowing = /following/.test(u) && /list/.test(u);
+    const isFans = /(follower|fans)/.test(u) && /list/.test(u);
 
     const path = url.split('?')[0];
     const qs = url.includes('?') ? url.slice(url.indexOf('?') + 1) : '';
@@ -36,24 +36,44 @@
     for (const kv of qs.split('&')) {
       if (!kv) continue;
       const i = kv.indexOf('=');
+      if (i < 0) continue;
       params[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
     }
-
-    console.group(`[诊断] #${hits[kind]} ${kind}  ${path}`);
 
     let json = null;
     try {
       json = JSON.parse(text);
     } catch (e) {
-      console.warn('  返回不是 JSON，前 200 字符：', String(text).slice(0, 200));
-      console.groupEnd();
+      if (isFollowing || isFans) {
+        console.warn('[诊断] 返回不是 JSON，前 200 字符：', String(text).slice(0, 200));
+      }
       return;
     }
+    if (!json || typeof json !== 'object') return;
 
     // 找列表字段：抖音不同版本用过 followings / followers / user_list / data / list
     const CANDIDATES = ['followings', 'followers', 'user_list', 'data', 'list', 'items'];
     const arrKey = CANDIDATES.find((k) => Array.isArray(json[k]));
     const arr = arrKey ? json[arrKey] : [];
+
+    if (!isFollowing && !isFans) {
+      // 只对“像用户列表”的未识别接口输出，避免把普通 JSON 全打出来
+      if (!arr.length) return;
+      hits.unknown++;
+      console.group(`[诊断] #${hits.unknown} 未识别接口  ${path}`);
+      console.log('  顶层字段 :', Object.keys(json).join(', '));
+      console.log('  列表字段 :', arrKey || '(没找到数组字段！)');
+      console.log('  本页条数 :', arr.length);
+      console.log('  请求参数 :', JSON.stringify(params));
+      console.log('  样例(截断):', JSON.stringify(arr[0]).slice(0, 500));
+      console.groupEnd();
+      return;
+    }
+
+    const kind = isFollowing ? 'following' : 'fans';
+    hits[kind]++;
+
+    console.group(`[诊断] #${hits[kind]} ${kind}  ${path}`);
 
     console.log('  顶层字段 :', Object.keys(json).join(', '));
     console.log('  列表字段 :', arrKey || '(没找到数组字段！)');
@@ -87,7 +107,7 @@
   XMLHttpRequest.prototype.send = function (...args) {
     try {
       const u = this.__dyUrl || '';
-      if (/\/(following|follower)\/list\//.test(u)) {
+      if (/list|follow|fans|mutual|relation/i.test(u)) {
         this.addEventListener('load', () => {
           try {
             const rt = this.responseType;
@@ -107,7 +127,7 @@
     const p = oFetch.apply(this, args);
     try {
       const u = typeof args[0] === 'string' ? args[0] : args[0] && args[0].url;
-      if (u && /\/(following|follower)\/list\//.test(String(u))) {
+      if (u && /list|follow|fans|mutual|relation/i.test(String(u))) {
         p.then((r) => r.clone().text().then((t) => report(String(u), t)).catch(() => {})).catch(() => {});
       }
     } catch (e) {}
@@ -120,5 +140,6 @@
   console.log('%c[诊断] 已挂载。现在切到「关注」标签滚动几次，再切到「粉丝」标签滚动几次。',
     'color:#3b82f6;font-weight:bold');
   console.log('  结束后用 __dyDiagStatus() 看一共抓到几次请求。');
-  console.log('  如果滚动很久都没有输出 —— 说明接口路径已经不是 /user/following|follower/list/，请到 Network 面板手动找。');
+  console.log('  如果滚动很久都没有 following/fans 输出，留意控制台里的「未识别接口」——');
+  console.log('  那说明接口路径改版了，把那段（URL + 顶层字段）发到 issue 即可。');
 })();
