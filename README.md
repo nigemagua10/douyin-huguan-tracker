@@ -16,6 +16,18 @@ python src/main.py --demo
 结果在 `demo/output/`，包含「取关了我」「新粉丝」等全部工作表，
 用的是一份**完全虚构**的数据，不会读取或修改你的任何真实数据。
 
+**想用自己的数据？** 最短路径：
+
+```bash
+git clone https://github.com/nigemagua10/douyin-huguan-tracker.git
+cd douyin-huguan-tracker
+python -m pip install -r requirements.txt
+# 按「使用 → 第一步」采集 JSON，放进 data/raw/
+python src/main.py
+```
+
+第一次运行只建立基线，第二次开始才会出现「取关了我 / 新粉丝」。
+
 ---
 
 ## 输出长什么样
@@ -80,7 +92,7 @@ python -m pip install -r requirements.txt
 
 ### 第一步：采集
 
-1. 浏览器（Chrome / Edge）登录 `www.douyin.com`
+1. 浏览器（Chrome / Edge / Comet 等 Chromium 浏览器）登录 `www.douyin.com`
 2. 打开**你自己的主页**，切到「关注」标签：
    `https://www.douyin.com/user/self?showTab=following`
 3. **用「代码片段」运行脚本**（`F12` 后）：
@@ -90,8 +102,9 @@ python -m pip install -r requirements.txt
    4. 在右边编辑区 `Ctrl+V` 粘贴
       [`collector/douyin_collector.js`](collector/douyin_collector.js) 的全部内容
    5. `Ctrl+Enter` 运行
-4. 右下角出现面板后，滚动加载「关注」列表
-5. 切到「粉丝」标签，脚本会继续记录（切换标签不会丢数据）
+4. 右下角出现面板后，让它**自动小步滚动**「关注」列表
+   （**不要手动一下拖到底**：虚拟列表会跳过中间页，顺序会乱）
+5. 面板显示「已到底」后，切到「粉丝」标签，同样等它滚到底
 6. 点面板上的 **【下载 JSON】**，把文件放进本项目的 `data/raw/` 目录
 
 > **为什么用代码片段而不是 Console？** 浏览器的 Self-XSS 保护会拦截往 Console
@@ -123,6 +136,10 @@ python -m pip install -r requirements.txt
 | `__dyDump()` | 手动触发下载 |
 | `__dyStop()` | 停止自动滚动 |
 | `__dyReset()` | 清空已采集数据 |
+| `__dyUnknown()` | 查看没认出来的用户列表接口（路径改版时反馈用） |
+
+> 如果面板出现 **「未识别接口 N 个」**，说明抖音又换了列表接口路径；
+> 控制台运行 `__dyUnknown()`，把里面的 `path` / `keys` 反馈到 issue 即可。
 
 > 数据会暂存在浏览器 localStorage 里，同一天内刷新页面不会丢。
 > 脚本改了去重逻辑之类会影响数据正确性的地方时，会提升存储版本号，
@@ -330,8 +347,10 @@ dy-huguan/
 
 ## 说明
 
-- 抖音页面结构变了的话，采集脚本里的接口路径正则可能要跟着调
-  （`/user/following/list/` 和 `/user/follower/list/`）。
+- 采集器匹配任何带 `following` / `follower` + `list` 的接口；如果抖音再改版，
+  面板会提示「未识别接口」，控制台 `__dyUnknown()` 或
+  [`collector/douyin_diagnose.js`](collector/douyin_diagnose.js) 能看到真实路径，
+  反馈到 issue 即可。
 - 建议每隔几天采一次，变化列表才有意义。
 - 采集器改了去重逻辑之类会影响数据正确性的地方时会提升 `STORE_VERSION`，
   浏览器里存的旧版本缓存会自动丢弃，不需要手动清理。
